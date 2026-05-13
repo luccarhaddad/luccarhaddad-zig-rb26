@@ -1,0 +1,19 @@
+# Build artifacts do Zig
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Dataset e dados de teste (grandes, regeneráveis)
+data/
+references.json
+references.json.gz
+test-data.json
+*.json.gz
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Sistema
+.DS_Store
