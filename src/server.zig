@@ -70,8 +70,10 @@ fn fraudScore(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const approved = score < knn.FRAUD_THRESHOLD;
 
     res.status = 200;
-    try res.json(.{
-        .approved = approved,
-        .fraud_score = score,
-    }, .{});
+    res.content_type = .JSON;
+    const w = res.writer();
+    try w.print("{{\"approved\":{s},\"fraud_score\":{d:.4}}}", .{
+        if (approved) "true" else "false",
+        score,
+    });
 }

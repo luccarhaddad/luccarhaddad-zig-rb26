@@ -17,40 +17,67 @@ const mcc_risk_table = std.StaticStringMap(f64).initComptime(.{
 });
 const MCC_DEFAULT: f64 = 0.5;
 
+/// Mirrors the request body shape. Defaults are applied for missing fields,
+/// `ignore_unknown_fields` lets us not list anything we don't use.
+const Request = struct {
+    transaction: Transaction = .{},
+    customer: Customer = .{},
+    merchant: Merchant = .{},
+    terminal: Terminal = .{},
+    last_transaction: ?LastTransaction = null,
+
+    const Transaction = struct {
+        amount: f64 = 0,
+        installments: f64 = 0,
+        requested_at: ?[]const u8 = null,
+    };
+    const Customer = struct {
+        avg_amount: f64 = 0,
+        tx_count_24h: f64 = 0,
+        known_merchants: [][]const u8 = &.{},
+    };
+    const Merchant = struct {
+        id: ?[]const u8 = null,
+        mcc: ?[]const u8 = null,
+        avg_amount: f64 = 0,
+    };
+    const Terminal = struct {
+        km_from_home: f64 = 0,
+        is_online: bool = false,
+        card_present: bool = false,
+    };
+    const LastTransaction = struct {
+        timestamp: ?[]const u8 = null,
+        km_from_current: f64 = 0,
+    };
+};
+
 pub fn parseQuery(
     allocator: std.mem.Allocator,
     body: []const u8,
-    vec_out: *[config.DIMS]f64
+    vec_out: *[config.DIMS]f64,
 ) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-
-    try vectorize(parsed.value, vec_out);
+    const req = try std.json.parseFromSliceLeaky(Request, allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    vectorize(&req, vec_out);
 }
 
-fn vectorize(json: std.json.Value, vec_out: *[config.DIMS]f64) !void {
+fn vectorize(r: *const Request, vec_out: *[config.DIMS]f64) void {
     @memset(vec_out, 0);
 
-    const transaction = getObjectOpt(json, "transaction");
-    const customer    = getObjectOpt(json, "customer");
-    const merchant    = getObjectOpt(json, "merchant");
-    const terminal    = getObjectOpt(json, "terminal");
-    const last_tx_opt = getObjectOpt(json, "last_transaction");
-
-    const tx_amount = getNumberOrDefault(transaction, "amount", 0);
-    const cust_avg  = getNumberOrDefault(customer, "avg_amount", 0);
+    const tx_amount = r.transaction.amount;
+    const cust_avg = r.customer.avg_amount;
 
     const requested_at: ?DateTime = blk: {
-        const s = getStringOpt(transaction, "requested_at") orelse break :blk null;
+        const s = r.transaction.requested_at orelse break :blk null;
         break :blk parseIsoUtc(s) catch null;
     };
 
-    // pos 0..2 (igual ao seu, sem o try)
     vec_out[0] = norm(tx_amount, MAX_AMOUNT);
-    vec_out[1] = norm(getNumberOrDefault(transaction, "installments", 0), MAX_INSTALLMENTS);
+    vec_out[1] = norm(r.transaction.installments, MAX_INSTALLMENTS);
     vec_out[2] = if (cust_avg > 0) norm(tx_amount / cust_avg, AMOUNT_VS_AVG_RATIO) else 0;
 
-    // pos 3, 4
     if (requested_at) |req| {
         vec_out[3] = @as(f64, @floatFromInt(req.hour)) / 23.0;
         vec_out[4] = @as(f64, @floatFromInt(dayOfWeekMondayBased(req))) / 6.0;
@@ -59,86 +86,40 @@ fn vectorize(json: std.json.Value, vec_out: *[config.DIMS]f64) !void {
         vec_out[4] = 0.5;
     }
 
-    if (last_tx_opt) |last_tx| {
+    if (r.last_transaction) |last_tx| {
         vec_out[5] = blk: {
             const req = requested_at orelse break :blk -1.0;
-            const ts_str = getStringOpt(last_tx, "timestamp") orelse break :blk -1.0;
+            const ts_str = last_tx.timestamp orelse break :blk -1.0;
             const ts = parseIsoUtc(ts_str) catch break :blk -1.0;
             const delta_s = epochSeconds(req) - epochSeconds(ts);
             const minutes = @as(f64, @floatFromInt(delta_s)) / 60.0;
             break :blk norm(minutes, MAX_MINUTES);
         };
-        vec_out[6] = norm(getNumberOrDefault(last_tx, "km_from_current", 0), MAX_KM);
+        vec_out[6] = norm(last_tx.km_from_current, MAX_KM);
     } else {
         vec_out[5] = -1.0;
         vec_out[6] = -1.0;
     }
 
-    vec_out[7]  = norm(getNumberOrDefault(terminal, "km_from_home", 0), MAX_KM);
-    vec_out[8]  = norm(getNumberOrDefault(customer, "tx_count_24h", 0), MAX_TX_COUNT_24H);
-    vec_out[9]  = boolToF64(getBoolOrDefault(terminal, "is_online", false));
-    vec_out[10] = boolToF64(getBoolOrDefault(terminal, "card_present", false));
+    vec_out[7] = norm(r.terminal.km_from_home, MAX_KM);
+    vec_out[8] = norm(r.customer.tx_count_24h, MAX_TX_COUNT_24H);
+    vec_out[9] = boolToF64(r.terminal.is_online);
+    vec_out[10] = boolToF64(r.terminal.card_present);
 
     vec_out[11] = blk: {
-        const mid = getStringOpt(merchant, "id") orelse break :blk 1.0;
-        const known = getArrayOpt(customer, "known_merchants") orelse break :blk 1.0;
-        for (known.items) |item| {
-            if (item == .string and std.mem.eql(u8, item.string, mid)) {
-                break :blk 0.0;
-            }
+        const mid = r.merchant.id orelse break :blk 1.0;
+        for (r.customer.known_merchants) |m| {
+            if (std.mem.eql(u8, m, mid)) break :blk 0.0;
         }
         break :blk 1.0;
     };
 
-    vec_out[12] = if (getStringOpt(merchant, "mcc")) |mcc|
+    vec_out[12] = if (r.merchant.mcc) |mcc|
         mcc_risk_table.get(mcc) orelse MCC_DEFAULT
     else
         MCC_DEFAULT;
 
-    // pos 13
-    vec_out[13] = norm(getNumberOrDefault(merchant, "avg_amount", 0), MAX_MERCHANT_AVG_AMOUNT);
-}
-
-fn getNumberOrDefault(obj_opt: ?std.json.Value, key: []const u8, default: f64) f64 {
-    const obj = obj_opt orelse return default;
-    const v = obj.object.get(key) orelse return default;
-    return switch (v) {
-        .float => |f| f,
-        .integer => |i| @floatFromInt(i),
-        else => default,
-    };
-}
-
-fn getBoolOrDefault(obj_opt: ?std.json.Value, key: []const u8, default: bool) bool {
-    const obj = obj_opt orelse return default;
-    const v = obj.object.get(key) orelse return default;
-    return switch (v) {
-        .bool => |b| b,
-        else => default,
-    };
-}
-
-fn getStringOpt(obj_opt: ?std.json.Value, key: []const u8) ?[]const u8 {
-    const obj = obj_opt orelse return null;
-    const v = obj.object.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-fn getObjectOpt(obj_opt: ?std.json.Value, key: []const u8) ?std.json.Value {
-    const obj = obj_opt orelse return null;
-    const v = obj.object.get(key) orelse return null;
-    if (v != .object) return null;
-    return v;
-}
-
-fn getArrayOpt(obj_opt: ?std.json.Value, key: []const u8) ?std.json.Array {
-    const obj = obj_opt orelse return null;
-    const v = obj.object.get(key) orelse return null;
-    if (v != .array) return null;
-    return v.array;
+    vec_out[13] = norm(r.merchant.avg_amount, MAX_MERCHANT_AVG_AMOUNT);
 }
 
 fn norm(value: f64, max: f64) f64 {
@@ -170,16 +151,16 @@ inline fn parseDigits(s: []const u8) !u32 {
 
 pub fn parseIsoUtc(s: []const u8) !DateTime {
     if (s.len < 20) return error.InvalidDateTime;
-    if (s[4]  != '-' or s[7]  != '-' or s[10] != 'T' or
+    if (s[4] != '-' or s[7] != '-' or s[10] != 'T' or
         s[13] != ':' or s[16] != ':' or s[19] != 'Z')
     {
         return error.InvalidDateTime;
     }
     return .{
-        .year   = @intCast(try parseDigits(s[0..4])),
-        .month  = @intCast(try parseDigits(s[5..7])),
-        .day    = @intCast(try parseDigits(s[8..10])),
-        .hour   = @intCast(try parseDigits(s[11..13])),
+        .year = @intCast(try parseDigits(s[0..4])),
+        .month = @intCast(try parseDigits(s[5..7])),
+        .day = @intCast(try parseDigits(s[8..10])),
+        .hour = @intCast(try parseDigits(s[11..13])),
         .minute = @intCast(try parseDigits(s[14..16])),
         .second = @intCast(try parseDigits(s[17..19])),
     };
