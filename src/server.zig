@@ -184,10 +184,11 @@ fn handleOneRequest(
 
 fn readHeaders(reader: *std.Io.Reader, buf: []u8) ![]const u8 {
     var len: usize = 0;
+    var one: [1]u8 = undefined;
     while (true) {
         if (len >= buf.len) return error.HeadersTooLarge;
-        const byte = try reader.readByte();
-        buf[len] = byte;
+        try reader.readSliceAll(&one);
+        buf[len] = one[0];
         len += 1;
         if (len >= 4 and
             buf[len - 4] == '\r' and buf[len - 3] == '\n' and
