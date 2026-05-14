@@ -114,11 +114,8 @@ fn handleOneRequest(
     persistent: std.mem.Allocator,
     dataset: *const dataset_mod.Dataset,
 ) !void {
-    // 1. Lê headers até \r\n\r\n. peekDelimiterInclusive bloqueia até achar.
-    // Como não temos isso direto, lemos linha por linha até linha vazia.
-    //
-    // Truque: pedimos pro reader achar "\r\n\r\n" via peek + take.
-    const headers_block = try readHeaders(reader);
+    var headers_buf: [8 * 1024]u8 = undefined;
+    const headers_block = try readHeaders(reader, &headers_buf);
 
     // 2. Parseia a primeira linha pra saber method + path.
     const first_line_end = std.mem.indexOfScalar(u8, headers_block, '\r') orelse {
@@ -185,17 +182,18 @@ fn handleOneRequest(
     try writer.flush();
 }
 
-fn readHeaders(reader: *std.Io.Reader) ![]const u8 {
-    const terminator = "\r\n\r\n";
-    var n: usize = terminator.len;
+fn readHeaders(reader: *std.Io.Reader, buf: []u8) ![]const u8 {
+    var len: usize = 0;
     while (true) {
-        const peeked = try reader.peek(n);
-        if (std.mem.indexOf(u8, peeked, terminator)) |idx| {
-            const headers = peeked[0..idx];
-            reader.toss(idx + terminator.len);
-            return headers;
+        if (len >= buf.len) return error.HeadersTooLarge;
+        const byte = try reader.readByte();
+        buf[len] = byte;
+        len += 1;
+        if (len >= 4 and
+            buf[len - 4] == '\r' and buf[len - 3] == '\n' and
+            buf[len - 2] == '\r' and buf[len - 1] == '\n')
+        {
+            return buf[0 .. len - 4];
         }
-        n = peeked.len + 256;
-        if (n > 8 * 1024) return error.HeadersTooLarge;
     }
 }

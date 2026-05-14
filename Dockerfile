@@ -17,7 +17,7 @@ RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
 
 COPY references.bin ./
 
-FROM scratch
+FROM busybox:1.37.0-musl
 COPY --from=build_amd64 /app/zig-out/bin/luccahaddad_rb26 /luccahaddad_rb26
 COPY --from=build_amd64 /app/references.bin /references.bin
 
