@@ -29,9 +29,9 @@ pub fn serve(
             .retain_allocated_bytes = 4096,
         },
         .thread_pool = .{
-            .count = 4,
+            .count = 1,
             .buffer_size = 16 * 1024,
-            .backlog = 256,
+            .backlog = 512,
         },
         .request = .{
             .max_body_size = 32 * 1024,

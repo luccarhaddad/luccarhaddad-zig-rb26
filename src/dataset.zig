@@ -1,30 +1,19 @@
 const std = @import("std");
 const config = @import("config.zig");
+const ivf = @import("ivf.zig");
 
 pub const Dataset = struct {
     vectors: []align(64) u8,
     labels: []u8,
+    centroids: []align(64) u8,
+    offsets: []u32,
     allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) !Dataset {
-        const vectors = try allocator.alignedAlloc(u8, .@"64", config.VECTORS_BYTES);
-        errdefer allocator.free(vectors);
-
-        const labels = try allocator.alloc(u8, config.LABELS_BYTES);
-        errdefer allocator.free(labels);
-
-        @memset(vectors, 0);
-        @memset(labels, 0);
-        return Dataset{
-            .vectors = vectors,
-            .labels = labels,
-            .allocator = allocator,
-        };
-    }
 
     pub fn deinit(self: *Dataset) void {
         self.allocator.free(self.vectors);
         self.allocator.free(self.labels);
+        self.allocator.free(self.centroids);
+        self.allocator.free(self.offsets);
     }
 
     pub fn quantize(v: f64) u8 {
@@ -33,36 +22,22 @@ pub const Dataset = struct {
         const scaled: f64 = clamped * 254.0 + 1.0;
         return @intFromFloat(@round(scaled));
     }
-
-    pub fn setRef(self: *Dataset, i: usize, vec_f64: []const f64, label_str: []const u8) void {
-        const base = i * config.PADDED_DIMS;
-        for (vec_f64, 0..) |v, j| {
-            self.vectors[base + j] = quantize(v);
-        }
-        self.labels[i] = if (std.mem.eql(u8, label_str, "fraud"))
-            config.FRAUD
-        else
-            config.LEGIT;
-    }
-
-    pub fn saveAsBin(self: *const Dataset, io: std.Io, path: []const u8) !void {
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-        defer file.close(io);
-
-        var write_buf: [64 * 1024]u8 = undefined;
-        var file_writer = file.writer(io, &write_buf);
-        const w: *std.Io.Writer = &file_writer.interface;
-
-        try w.writeAll(self.vectors);
-        try w.writeAll(self.labels);
-        try w.flush();
-    }
 };
 
-pub fn decompressGzip(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+fn setRefRaw(vectors: []u8, labels: []u8, i: usize, vec_f64: []const f64, label_str: []const u8) void {
+    const base = i * config.PADDED_DIMS;
+    for (vec_f64, 0..) |v, j| {
+        vectors[base + j] = Dataset.quantize(v);
+    }
+    labels[i] = if (std.mem.eql(u8, label_str, "fraud"))
+        config.FRAUD
+    else
+        config.LEGIT;
+}
+
+fn decompressGzip(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     var file = try cwd.openFile(io, path, .{ .mode = .read_only });
-
     defer file.close(io);
 
     var file_buf: [64 * 1024]u8 = undefined;
@@ -78,11 +53,10 @@ pub fn decompressGzip(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     );
 
     _ = try decompress.reader.streamRemaining(&out.writer);
-
     return try out.toOwnedSlice();
 }
 
-pub fn parseJsonInto(allocator: std.mem.Allocator, json_bytes: []const u8, dataset: *Dataset) !void {
+fn parseJsonInto(allocator: std.mem.Allocator, json_bytes: []const u8, vectors: []u8, labels: []u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(allocator, json_bytes);
     defer scanner.deinit();
 
@@ -101,7 +75,6 @@ pub fn parseJsonInto(allocator: std.mem.Allocator, json_bytes: []const u8, datas
 
         var have_vector = false;
         var label_buf: [16]u8 = undefined;
-
         var label_len: usize = 0;
 
         while (true) {
@@ -139,28 +112,78 @@ pub fn parseJsonInto(allocator: std.mem.Allocator, json_bytes: []const u8, datas
         }
 
         if (!have_vector) return error.MissingVector;
-        dataset.setRef(ref_idx, &vec_buf, label_buf[0..label_len]);
+        setRefRaw(vectors, labels, ref_idx, &vec_buf, label_buf[0..label_len]);
         ref_idx += 1;
     }
 }
 
-pub fn load(io: std.Io, persistent_allocator: std.mem.Allocator, path: []const u8) !Dataset {
-    var dataset = try Dataset.init(persistent_allocator);
-    errdefer dataset.deinit();
+/// Reads the JSON source, builds IVF, and writes the .bin file.
+/// Used by the `--gen-bin` mode (offline).
+pub fn genBin(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    out_path: []const u8,
+) !void {
+    // 1. Allocate raw vectors+labels (pre-clustering).
+    const raw_vectors = try allocator.alignedAlloc(u8, .@"64", config.VECTORS_BYTES);
+    defer allocator.free(raw_vectors);
+    const raw_labels = try allocator.alloc(u8, config.LABELS_BYTES);
+    defer allocator.free(raw_labels);
+    @memset(raw_vectors, 0);
+    @memset(raw_labels, 0);
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const temp = arena.allocator();
+    // 2. Decompress + parse JSON (arena freed before IVF build to reclaim memory).
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
 
-    const json_bytes = try decompressGzip(io, temp, path);
-    try parseJsonInto(temp, json_bytes, &dataset);
+        std.debug.print("Decompressing {s}...\n", .{source_path});
+        const json_bytes = try decompressGzip(io, temp, source_path);
+        std.debug.print("Parsing JSON ({d} bytes)...\n", .{json_bytes.len});
+        try parseJsonInto(temp, json_bytes, raw_vectors, raw_labels);
+    }
 
-    return dataset;
+    // 3. Build IVF (clusters + reorganizes).
+    const out = try ivf.build(allocator, raw_vectors, raw_labels);
+    defer {
+        allocator.free(out.centroids);
+        allocator.free(out.offsets);
+        allocator.free(out.vectors);
+        allocator.free(out.labels);
+    }
+
+    // 4. Write everything to .bin.
+    var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer file.close(io);
+
+    var write_buf: [64 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    const w: *std.Io.Writer = &file_writer.interface;
+
+    try w.writeAll(out.vectors);
+    try w.writeAll(out.labels);
+    try w.writeAll(out.centroids);
+    try w.writeAll(std.mem.sliceAsBytes(out.offsets));
+    try w.flush();
+
+    std.debug.print("Wrote {s}\n", .{out_path});
 }
 
+/// Loads a fully built .bin (with IVF data).
 pub fn loadFromBin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Dataset {
-    var dataset = try Dataset.init(allocator);
-    errdefer dataset.deinit();
+    const vectors = try allocator.alignedAlloc(u8, .@"64", config.VECTORS_BYTES);
+    errdefer allocator.free(vectors);
+
+    const labels = try allocator.alloc(u8, config.LABELS_BYTES);
+    errdefer allocator.free(labels);
+
+    const centroids = try allocator.alignedAlloc(u8, .@"64", ivf.K_CLUSTERS * config.PADDED_DIMS);
+    errdefer allocator.free(centroids);
+
+    const offsets = try allocator.alloc(u32, ivf.K_CLUSTERS + 1);
+    errdefer allocator.free(offsets);
 
     var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close(io);
@@ -169,8 +192,16 @@ pub fn loadFromBin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
     var file_reader = file.reader(io, &read_buf);
     const r: *std.Io.Reader = &file_reader.interface;
 
-    try r.readSliceAll(dataset.vectors);
-    try r.readSliceAll(dataset.labels);
+    try r.readSliceAll(vectors);
+    try r.readSliceAll(labels);
+    try r.readSliceAll(centroids);
+    try r.readSliceAll(std.mem.sliceAsBytes(offsets));
 
-    return dataset;
+    return .{
+        .vectors = vectors,
+        .labels = labels,
+        .centroids = centroids,
+        .offsets = offsets,
+        .allocator = allocator,
+    };
 }

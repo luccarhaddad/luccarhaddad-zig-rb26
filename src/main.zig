@@ -10,12 +10,8 @@ pub fn main(init: std.process.Init) !void {
     // ---- Modo gerador: ./binário --gen-bin ----
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--gen-bin")) {
-        std.debug.print("Gerando references.bin a partir de .gz...\n", .{});
-        var dataset = try dataset_mod.load(io, persistent, config.REFERENCES_PATH);
-        defer dataset.deinit();
-        try dataset.saveAsBin(io, "references.bin");
-        const mb = (config.VECTORS_BYTES + config.LABELS_BYTES) / (1024 * 1024);
-        std.debug.print("references.bin gerado ({d} MB)\n", .{mb});
+        std.debug.print("Gerando references.bin a partir de .gz (com IVF)...\n", .{});
+        try dataset_mod.genBin(io, persistent, config.REFERENCES_PATH, "references.bin");
         return;
     }
 

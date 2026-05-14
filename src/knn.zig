@@ -59,26 +59,64 @@ const TopK = struct {
 
 };
 
+const ivf_mod = @import("ivf.zig");
+
+const ProbeEntry = struct { dist: i32, idx: u32 };
+
+/// Finds the M nearest centroids to the query.
+fn probeCentroids(dataset: *const dataset_mod.Dataset, query: Vec16u8, out: *[ivf_mod.M_PROBE]ProbeEntry) void {
+    const K = ivf_mod.K_CLUSTERS;
+    const M = ivf_mod.M_PROBE;
+
+    // Initialize with the first M centroids.
+    var m: u32 = 0;
+    while (m < M) : (m += 1) {
+        const base = @as(usize, m) * config.PADDED_DIMS;
+        const c: Vec16u8 = dataset.centroids[base..][0..config.PADDED_DIMS].*;
+        out[m] = .{ .dist = distSquared(query, c), .idx = m };
+    }
+    sortAscending(out);
+
+    // Scan the rest, replacing the worst entry when a closer one is found.
+    var k: u32 = M;
+    while (k < K) : (k += 1) {
+        const base = @as(usize, k) * config.PADDED_DIMS;
+        const c: Vec16u8 = dataset.centroids[base..][0..config.PADDED_DIMS].*;
+        const d = distSquared(query, c);
+        if (d >= out[M - 1].dist) continue;
+
+        // Insert in sorted position.
+        var pos: usize = M - 1;
+        while (pos > 0 and out[pos - 1].dist > d) : (pos -= 1) {
+            out[pos] = out[pos - 1];
+        }
+        out[pos] = .{ .dist = d, .idx = k };
+    }
+}
+
+fn sortAscending(arr: *[ivf_mod.M_PROBE]ProbeEntry) void {
+    // Insertion sort — M is small (16).
+    var i: usize = 1;
+    while (i < ivf_mod.M_PROBE) : (i += 1) {
+        const cur = arr[i];
+        var j: usize = i;
+        while (j > 0 and arr[j - 1].dist > cur.dist) : (j -= 1) {
+            arr[j] = arr[j - 1];
+        }
+        arr[j] = cur;
+    }
+}
+
 pub fn classify(dataset: *const dataset_mod.Dataset, query: Vec16u8) f32 {
     var topk = TopK.init();
+    var probes: [ivf_mod.M_PROBE]ProbeEntry = undefined;
+    probeCentroids(dataset, query, &probes);
 
-    {
-        var i: u32 = 0;
-        while (i < K_NEIGHBORS) : (i += 1) {
-            const base = @as(usize, i) * config.PADDED_DIMS;
-            const ref: Vec16u8 = dataset.vectors[base..][0..config.PADDED_DIMS].*;
-            const d = distSquared(query, ref);
-            topk.maybeInsert(d, i);
-        }
-    }
-
-    var i: u32 = K_NEIGHBORS;
-    while (i < config.NUM_REFS) : (i += 1) {
-        const base = @as(usize, i) * config.PADDED_DIMS;
-        const ref: Vec16u8 = dataset.vectors[base..][0..config.PADDED_DIMS].*;
-        const threshold: i32 = topk.dists[K_NEIGHBORS - 1];
-        const d = distSquaredEarly(query, ref, threshold);
-        if (d < threshold) topk.maybeInsert(d, i);
+    // Scan refs in the probed clusters.
+    for (probes) |p| {
+        const start = dataset.offsets[p.idx];
+        const end = dataset.offsets[p.idx + 1];
+        scanRange(dataset, query, start, end, &topk);
     }
 
     var fraud_count: u32 = 0;
@@ -87,6 +125,52 @@ pub fn classify(dataset: *const dataset_mod.Dataset, query: Vec16u8) f32 {
     }
 
     return @as(f32, @floatFromInt(fraud_count)) / @as(f32, @floatFromInt(K_NEIGHBORS));
+}
+
+/// Inner scan over a contiguous range of refs.
+/// Unrolled 4-wide for instruction-level parallelism: the CPU can pipeline
+/// 4 independent distance computations rather than waiting on each in turn.
+fn scanRange(
+    dataset: *const dataset_mod.Dataset,
+    query: Vec16u8,
+    start: u32,
+    end: u32,
+    topk: *TopK,
+) void {
+    const D = config.PADDED_DIMS;
+    var i: u32 = start;
+
+    while (i + 4 <= end) : (i += 4) {
+        const base0 = @as(usize, i) * D;
+        const base1 = @as(usize, i + 1) * D;
+        const base2 = @as(usize, i + 2) * D;
+        const base3 = @as(usize, i + 3) * D;
+
+        const r0: Vec16u8 = dataset.vectors[base0..][0..D].*;
+        const r1: Vec16u8 = dataset.vectors[base1..][0..D].*;
+        const r2: Vec16u8 = dataset.vectors[base2..][0..D].*;
+        const r3: Vec16u8 = dataset.vectors[base3..][0..D].*;
+
+        const threshold = topk.dists[K_NEIGHBORS - 1];
+        const d0 = distSquaredEarly(query, r0, threshold);
+        const d1 = distSquaredEarly(query, r1, threshold);
+        const d2 = distSquaredEarly(query, r2, threshold);
+        const d3 = distSquaredEarly(query, r3, threshold);
+
+        if (d0 < threshold) topk.maybeInsert(d0, i);
+        if (d1 < topk.dists[K_NEIGHBORS - 1]) topk.maybeInsert(d1, i + 1);
+        if (d2 < topk.dists[K_NEIGHBORS - 1]) topk.maybeInsert(d2, i + 2);
+        if (d3 < topk.dists[K_NEIGHBORS - 1]) topk.maybeInsert(d3, i + 3);
+    }
+
+    // Tail (remaining 0..3 refs).
+    while (i < end) : (i += 1) {
+        const base = @as(usize, i) * D;
+        const ref: Vec16u8 = dataset.vectors[base..][0..D].*;
+        const threshold = topk.dists[K_NEIGHBORS - 1];
+        const d = distSquaredEarly(query, ref, threshold);
+        if (d < threshold) topk.maybeInsert(d, i);
+    }
 }
 
 pub fn quantizeQuery(vec_f64: *const [config.DIMS]f64) Vec16u8 {
