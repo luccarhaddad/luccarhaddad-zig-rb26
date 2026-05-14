@@ -1,6 +1,6 @@
 services:
   app1:
-    image: luccarhaddad/rinha-2026-zig:v2
+    image: luccarhaddad/rinha-2026-zig:v3
     networks:
       - rinha
     healthcheck:
@@ -16,7 +16,7 @@ services:
           memory: "120MB"
 
   app2:
-    image: luccarhaddad/rinha-2026-zig:v2
+    image: luccarhaddad/rinha-2026-zig:v3
     networks:
       - rinha
     healthcheck:
