@@ -4,7 +4,7 @@ const knn = @import("knn.zig");
 
 pub const K_CLUSTERS: u32 = 1024;
 pub const M_PROBE: u32 = 16;
-pub const KMEANS_ITERS: u32 = 5;
+pub const KMEANS_ITERS: u32 = 15;
 pub const KMEANS_SEED: u64 = 42;
 
 const Vec16u8 = knn.Vec16u8;
@@ -50,22 +50,71 @@ pub fn build(
     var counts = try allocator.alloc(u32, K);
     defer allocator.free(counts);
 
-    // 1. Initialize centroids = K random refs.
+    // 1. Initialize centroids via K-means++.
+    //
+    //   * pick the first centroid uniformly at random;
+    //   * for each subsequent centroid, pick a point with probability
+    //     proportional to its squared distance to the nearest already-chosen
+    //     centroid (so far points sit, more likely they get picked).
+    //
+    // Already-chosen centroids have min_dist = 0 by construction (distance to
+    // self), so they are never re-picked.
+    std.debug.print("  init: k-means++...\n", .{});
     var prng = std.Random.DefaultPrng.init(KMEANS_SEED);
     const rnd = prng.random();
-    var seen = try allocator.alloc(bool, N);
-    defer allocator.free(seen);
-    @memset(seen, false);
 
-    var picked: u32 = 0;
-    while (picked < K) {
+    // min squared distance from each point to its nearest already-chosen centroid.
+    var min_dist = try allocator.alloc(u64, N);
+    defer allocator.free(min_dist);
+    @memset(min_dist, std.math.maxInt(u64));
+
+    // First centroid: uniform random.
+    {
         const idx = rnd.intRangeAtMost(usize, 0, N - 1);
-        if (seen[idx]) continue;
-        seen[idx] = true;
-        const src = src_vectors[idx * D .. (idx + 1) * D];
-        const dst = centroids[picked * D .. (picked + 1) * D];
-        @memcpy(dst, src);
-        picked += 1;
+        @memcpy(
+            centroids[0..D],
+            src_vectors[idx * D .. (idx + 1) * D],
+        );
+    }
+
+    var picked: u32 = 1;
+    while (picked < K) : (picked += 1) {
+        // Update min_dist with distance to the centroid just placed (index = picked-1).
+        const last = picked - 1;
+        const new_centroid: Vec16u8 = centroids[last * D ..][0..D].*;
+
+        var total: u64 = 0;
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            const ref: Vec16u8 = src_vectors[i * D ..][0..D].*;
+            const d: u64 = @intCast(knn.distSquared(ref, new_centroid));
+            if (d < min_dist[i]) min_dist[i] = d;
+            total += min_dist[i];
+        }
+
+        // Sample new centroid with probability proportional to min_dist.
+        var sel: usize = N - 1;
+        if (total > 0) {
+            const r = rnd.uintLessThan(u64, total);
+            var cum: u64 = 0;
+            i = 0;
+            while (i < N) : (i += 1) {
+                cum += min_dist[i];
+                if (cum > r) {
+                    sel = i;
+                    break;
+                }
+            }
+        } else {
+            // Degenerate: every remaining point coincides with some centroid.
+            // Won't happen in practice with N >> K, but be safe.
+            sel = rnd.intRangeAtMost(usize, 0, N - 1);
+        }
+
+        @memcpy(
+            centroids[picked * D .. (picked + 1) * D],
+            src_vectors[sel * D .. (sel + 1) * D],
+        );
     }
 
     // 2. K-means iterations.
