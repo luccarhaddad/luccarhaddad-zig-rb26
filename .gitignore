@@ -17,3 +17,6 @@ test-data.json
 
 # Sistema
 .DS_Store
+
+# dados
+references.bin

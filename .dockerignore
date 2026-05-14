@@ -1,0 +1,6 @@
+# .dockerignore
+references.json.gz
+zig-cache/
+zig-out/
+.zig-cache/
+.git/
