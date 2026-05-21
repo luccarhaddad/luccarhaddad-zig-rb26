@@ -3,7 +3,7 @@ const config = @import("config.zig");
 const knn = @import("knn.zig");
 
 pub const K_CLUSTERS: u32 = 1024;
-pub const M_PROBE: u32 = 16;
+pub const M_PROBE: u32 = 8;
 pub const KMEANS_ITERS: u32 = 15;
 pub const KMEANS_SEED: u64 = 42;
 
