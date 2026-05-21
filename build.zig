@@ -12,12 +12,6 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
 
-    const httpz = b.dependency("httpz", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe_mod.addImport("httpz", httpz.module("httpz"));
-
     const exe = b.addExecutable(.{
         .name = "luccahaddad_rb26",
         .root_module = exe_mod,
