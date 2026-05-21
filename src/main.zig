@@ -24,5 +24,5 @@ pub fn main(init: std.process.Init) !void {
         (config.VECTORS_BYTES + config.LABELS_BYTES) / (1024 * 1024),
     });
 
-    try server_mod.serve(io, persistent, &dataset);
+    try server_mod.serve(persistent, &dataset);
 }
